@@ -2,7 +2,7 @@
 
 ## 功能
 
-对 PostgreSQL 存储过程进行字段级血缘分析，追溯结果表字段至最上层来源表。支持：
+对 PostgreSQL / Oracle / TDSQL 存储过程进行字段级血缘分析，追溯结果表字段至最上层来源表。支持：
 - 字段血缘类型区分（直接引用 / CASE WHEN / 算术计算 / 窗口函数等）
 - 跨临时表 expression 透传（跨多层临时表回溯完整表达式）
 - 跨存储过程追溯（通过数据库元数据定位子过程的临时表，递归解析）
@@ -26,7 +26,9 @@ pg-lineage/
 ├── src/
 │   ├── parser.py               # 核心解析器
 │   ├── connectors/
-│   │   └── postgres_conn.py   # PostgreSQL 连接器
+│   │   ├── postgres_conn.py   # PostgreSQL 连接器
+│   │   ├── oracle_conn.py     # Oracle 连接器
+│   │   └── tdsql_conn.py      # TDSQL 连接器
 │   └── output/
 │       ├── formatter.py        # 输出格式化（summary / json / csv / sql）
 │       └── mapping_fmt.py      # 字段血缘 mapping 文档
@@ -74,6 +76,7 @@ python3 run.py \
 | `--format` / `-f` | 否 | 输出格式，默认 summary |
 | `--cross-proc` | 否 | 启用跨过程追溯 |
 | `--validate-registry` | 否 | 启用来源表注册校验 |
+| `--dialect` | 否 | SQL 方言：postgres / oracle / mysql / tsql，默认 postgres |
 
 ### 输出格式
 
@@ -91,6 +94,15 @@ python3 run.py \
 ```
 帮我用 pg-lineage 分析 tristan 数据库里的 p_gen_sale_report 存储过程
 ```
+
+支持多数据库，按 `--dialect` 参数选择连接器：
+
+| dialect | 连接器 | 驱动 |
+|---------|--------|------|
+| `postgres` | PostgresConnector | psycopg2 |
+| `oracle` | OracleConnector | oracledb |
+| `mysql` | TDSqlConnector | pymysql |
+| `tsql` | TDSqlConnector | pymysql |
 Codex 会自动读取此 skill 并调用 `run.py` 执行。
 
 ### Python API
@@ -100,10 +112,20 @@ import sys
 sys.path.insert(0, "~/codex-skills/pg-lineage")
 
 from src.connectors.postgres_conn import PostgresConnector
+from src.connectors.oracle_conn   import OracleConnector
+from src.connectors.tdsql_conn    import TDSqlConnector
 from src.parser import ProcedureLineageParser, ProcedureLineageParserV2
 from src.output.formatter import to_json, summary, to_mapping
 
+# PostgreSQL
 conn = PostgresConnector(host="localhost", port=5432, db="tristan", user="tristan")
+
+# Oracle
+# conn = OracleConnector(host="localhost", port=1521, db="XE", user="SCOTT", password="tiger")
+
+# TDSQL / MySQL
+# conn = TDSqlConnector(host="localhost", port=3306, db="test", user="root", password="")
+
 conn.connect()
 
 # 简单模式（不跨过程）

@@ -3,7 +3,7 @@ pg-lineage: PostgreSQL 存储过程字段血缘分析 Skill
 
 一、这是什么
 -----------
-pg-lineage 是一个 Codex skill，用于对 PostgreSQL 存储过程进行字段级血缘分析。
+pg-lineage 是一个 Codex skill，用于对 PostgreSQL / Oracle / TDSQL 存储过程进行字段级血缘分析。
 给定一个存储过程名称，它会解析该存储过程的源码，追溯结果表中每个字段的血缘链路，
 找出该字段最终来自哪张最上层来源表的哪个字段，以及经过了什么样的变换。
 
@@ -52,7 +52,18 @@ Codex 会自动读取此 skill 并调用 run.py 执行。
 命令行直接调用：
 
   cd ~/codex-skills/pg-lineage
-  python3 run.py -H localhost -P 5432 -d tristan -u tristan     --proc p_gen_sale_report --schema public --format summary
+
+  # PostgreSQL
+  python3 run.py -H localhost -P 5432 -d tristan -u tristan \
+      --proc p_gen_sale_report --schema public --format summary
+
+  # Oracle（需安装 oracledb）
+  python3 run.py -H localhost -P 1521 -d XE -u scott -p tiger \
+      --proc MY_PROC --schema SCOTT --dialect oracle --format summary
+
+  # TDSQL / MySQL（需安装 pymysql）
+  python3 run.py -H localhost -P 3306 -d test -u root \
+      --proc my_proc --schema test --dialect tsql --format summary
 
 参数说明：
   -H / --host      数据库地址，默认 localhost
@@ -63,7 +74,7 @@ Codex 会自动读取此 skill 并调用 run.py 执行。
   --proc           存储过程名（必填）
   -s / --schema    Schema，默认 public
   -f / --format    输出格式：summary / mapping / json / csv / sql
-  --dialect        SQL 方言，默认 postgres
+  --dialect        SQL 方言：postgres / oracle / mysql / tsql，默认 postgres
   --cross-proc     启用跨存储过程追溯
   --validate-registry  启用来源表注册校验
 
@@ -138,7 +149,9 @@ conn.close()
 
 八、扩展方向
 -----------
-- 接入 Oracle / TDSQL connector，实现多数据库支持
+- 已实现：PostgreSQL / Oracle / TDSQL 多数据库支持
+- 增强动态 SQL 的列级别精确度（当前依赖 metadata 回查）
+- 血缘结果持久化到数据库表，支持历史版本对比
 - 增强动态 SQL 的列级别精确度（当前依赖 metadata 回查）
 - 血缘结果持久化到数据库表，支持历史版本对比
 
@@ -154,8 +167,8 @@ pg-lineage/
     parser.py           - 核心解析器（~1100行）
     connectors/
       postgres_conn.py  - PostgreSQL 连接器
-      oracle_conn.py    - Oracle 连接器（待实现）
-      tdsql_conn.py     - TDSQL 连接器（待实现）
+      oracle_conn.py    - Oracle 连接器
+      tdsql_conn.py     - TDSQL 连接器
     output/
       formatter.py      - 输出格式化（summary/json/csv/sql）
       mapping_fmt.py    - 字段血缘 mapping 文档
