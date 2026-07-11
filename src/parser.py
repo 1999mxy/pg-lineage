@@ -284,6 +284,61 @@ def extract_select_columns(select_sql: str, dialect: str = "postgres") -> list[s
 # 4. 语句解析（识别 DDL 类型）
 # ---------------------------------------------------------------
 
+
+# ---------------------------------------------------------------
+# 动态 SQL 解析（方案 B：数据库元数据回查）
+# ---------------------------------------------------------------
+
+def _extract_execute_sql(raw):
+    raw_stripped = raw.strip()
+    # EXECUTE format("...", ...)
+    fm = re.search(
+        r'(?i)\bEXECUTE\s+format\s*\(\s*([\x27\x22])(.+?)\1(?:\s*,|\s*\))',
+        raw_stripped, re.DOTALL
+    )
+    if fm:
+        return fm.group(2)
+    # EXECUTE '...' 或 EXECUTE "..."
+    fm = re.search(
+        r"(?i)\bEXECUTE\s+([\x27\x22])(.+?)\1(?:\s+USING|\s+INTO|\s*;|\s*$)",
+        raw_stripped, re.DOTALL
+    )
+    if fm:
+        sql = fm.group(2)
+        ui = re.search(r"(?i)\bUSING\b", sql)
+        if ui:
+            sql = sql[:ui.start()]
+        return sql.strip()
+    return None
+
+
+def _extract_src_table_from_sql(sql):
+    upper = sql.upper()
+    depth, fp, i = 0, -1, 0
+    while i < len(sql) - 1:
+        i += 1
+        ch = sql[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch in ("\x27", "\x22"):
+            q, j = ch, i + 1
+            while j < len(sql) and not (sql[j] == q and sql[j-1] != "\\"):
+                j += 1
+            i = j
+        elif depth == 0 and upper.startswith("FROM", i):
+            fp = i + 4
+            break
+    if fp < 0:
+        return None
+    rest = sql[fp:].lstrip()
+    if rest.startswith("("):
+        return None
+    m = re.match(r"([A-Za-z_][A-Za-z0-9_]*)", rest)
+    return m.group(1).lower() if m else None
+
+
 def split_statements(body: str, dialect: str = "postgres") -> list[dict]:
     """
     将存储过程体拆成独立语句。
@@ -357,6 +412,24 @@ def split_statements(body: str, dialect: str = "postgres") -> list[dict]:
                 "source_table_names": src_tables,
             })
             continue
+        # EXECUTE 动态 SQL —— 方案 B：提取 FROM 表名，字段血缘依赖 metadata 回查
+        exe_m = re.search(r"(?i)EXECUTE", raw)
+        if exe_m:
+            exec_sql = _extract_execute_sql(raw)
+            if exec_sql:
+                src_tbl = _extract_src_table_from_sql(exec_sql)
+                exec_select_cols = extract_select_columns("SELECT " + exec_sql, dialect)
+                statements.append({
+                    "type": "execute_dynamic",
+                    "raw_sql": exec_sql,
+                    "src_table": src_tbl,
+                    "cols": exec_select_cols,
+                    "fallback_to_metadata": True,
+                })
+            else:
+                statements.append({"type": "execute_unknown", "raw": raw})
+            continue
+
     return statements
 
 
@@ -563,7 +636,7 @@ def _extract_referenced_tmp_tables(schema_map: dict, select_sql: str) -> set[str
 # 8. 构建 Schema Map（正向）
 # ---------------------------------------------------------------
 
-def build_schema_map(stmts: list[dict], dialect: str = "postgres") -> dict[str, TempTableSchema]:
+def build_schema_map(stmts: list[dict], dialect: str = "postgres", conn=None) -> dict[str, TempTableSchema]:
     """遍历所有语句，构建每个临时表/结果表的字段血缘 schema_map。"""
     schema_map: dict[str, TempTableSchema] = {}
 
@@ -678,6 +751,21 @@ def build_schema_map(stmts: list[dict], dialect: str = "postgres") -> dict[str, 
                 schema_map[tbl_name].add_column(col, cs)
         elif stmt_type == "insert_into":
             _process_select_stmt(tbl_name, stmt["select"], stmt.get("cols"), stmt.get("source_table_names"))
+
+        elif stmt_type == "execute_dynamic":
+            # 方案 B：动态 SQL，从 SQL 字面提取列名，列不全时用 metadata 回查
+            src_tbl = stmt.get("src_table", "")
+            raw_cols = stmt.get("cols", [])
+            if conn and src_tbl and not raw_cols:
+                raw_cols = conn.get_table_columns(src_tbl)
+            if src_tbl:
+                schema_map.setdefault(tbl_name, TempTableSchema(tbl_name))
+                schema_map[tbl_name].source_table_names.add(src_tbl)
+                for col in raw_cols:
+                    cs = ColumnSource(src_tbl, col, direct=True, is_tmp=False)
+                    schema_map[tbl_name].add_column(col, cs)
+        elif stmt_type == "execute_unknown":
+            pass
 
     return schema_map
 
@@ -891,7 +979,7 @@ class ProcedureLineageParser:
         raw = conn.get_procedure_source(proc_name, schema)
         body = extract_body(raw)
         stmts = split_statements(body, self.dialect)
-        schema_map = build_schema_map(stmts, self.dialect)
+        schema_map = build_schema_map(stmts, self.dialect, conn)
         result_tables = [t for t in schema_map if not _is_temp_table(t)]
         result_tables_lineage = []
         for tbl in result_tables:
@@ -968,7 +1056,7 @@ def _resolve_cross_procedure(
     raw = conn.get_procedure_source(creating_proc, "public")
     body = extract_body(raw)
     stmts = split_statements(body, dialect)
-    sub_schema_map = build_schema_map(stmts, dialect)
+    sub_schema_map = build_schema_map(stmts, dialect, conn)
     # 对子过程 schema_map 再次触发跨过程追溯，补全子过程中引用的 tmp 的来源
     _resolve_all_cross_procedures(
         sub_schema_map, creating_proc,
@@ -1050,7 +1138,7 @@ class ProcedureLineageParserV2:
         raw = conn.get_procedure_source(proc_name, schema)
         body = extract_body(raw)
         stmts = split_statements(body, self.dialect)
-        schema_map = build_schema_map(stmts, self.dialect)
+        schema_map = build_schema_map(stmts, self.dialect, conn)
         _resolve_all_cross_procedures(
             schema_map, proc_name,
             conn, visited, self.dialect,

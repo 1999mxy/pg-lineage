@@ -121,3 +121,17 @@ class PostgresConnector:
                 if tmp_name not in result:
                     result[tmp_name] = (proc_name, proc_src)
         return result
+    def get_table_columns(self, table_name: str, schema: str = "public") -> list[str]:
+        """从 information_schema 查询表的所有列名"""
+        if self._conn is None:
+            self.connect()
+        cur = self._conn.cursor()
+        cur.execute("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s
+            ORDER BY ordinal_position
+        """, (schema, table_name))
+        rows = cur.fetchall()
+        cur.close()
+        return [r[0].lower() for r in rows]
