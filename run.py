@@ -20,6 +20,8 @@ pg-lineage 命令行入口
 
 import sys
 import os
+_vendor_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vendor', 'pkgs')
+sys.path.insert(0, _vendor_dir)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import argparse
