@@ -45,6 +45,9 @@ def parse_args():
                         choices=["summary", "json", "csv", "sql", "mapping"],
                         default="summary")
     parser.add_argument("--indent", "-i", type=int, default=2)
+    parser.add_argument("--dialect", default="postgres",
+                        choices=["postgres", "oracle", "mysql", "tsql"],
+                        help="SQL dialect for parser (default postgres)")
     parser.add_argument("--cross-proc", action="store_true",
                         help="跨过程追溯：穿透子过程临时表至最上层源表")
     parser.add_argument("--validate-registry", action="store_true",
@@ -78,7 +81,7 @@ def main():
         conn.connect()
 
         ParserClass = ProcedureLineageParserV2 if args.cross_proc else ProcedureLineageParser
-        parser = ParserClass(db_type="postgresql", dialect="postgres")
+        parser = ParserClass(db_type="postgresql", dialect=args.dialect)
         result, schema_map = parser.parse_full(args.proc, args.schema, conn)
 
         # 校验

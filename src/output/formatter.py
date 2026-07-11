@@ -151,12 +151,11 @@ def summary(result: dict, schema_map: dict = None) -> str:
             src_cols = row.get("src_columns", [])
 
             if lt == "direct":
-                if result_col in direct_attributed:
-                    continue
+                # P1-6: derived 已独立追溯，direct 只追加到其 root 组
+                # 不再用 direct_attributed 阻断，防止 derived 截断
                 root = _get_root(src_t, src_c)
-                if root:
-                    groups[root].add(result_col)
-                    direct_attributed.add(result_col)
+                if root and result_col not in groups.get(root, set()):
+                    groups.setdefault(root, set()).add(result_col)
             else:
                 # derived: 每个 src_columns 条目独立追溯
                 cols_to_trace = src_cols if src_cols else [(src_t, src_c)]
@@ -167,7 +166,7 @@ def summary(result: dict, schema_map: dict = None) -> str:
                     root = _get_root(s_t, s_c)
                     if root and root not in seen_roots:
                         seen_roots.add(root)
-                        groups[root].add(result_col)
+                        groups.setdefault(root, set()).add(result_col)
 
         for src_tbl, cols in sorted(groups.items()):
             cols_str = ", ".join(sorted(cols))

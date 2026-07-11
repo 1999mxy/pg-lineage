@@ -123,12 +123,16 @@ def _build_mapping_rows(
             expr = r.get("expression") or ""
             chain_str = r.get("chain") or ""
 
-            # 追溯到 root_table
+            # P1-5: 追溯到 root_table，链路包含表名+列名
             if src_t and _is_temp_table(src_t) and sm:
-                root_t, _, chain = _trace_to_root(sm, src_t, src_c)
-                chain_str = " -> ".join(chain) if chain else chain_str
+                root_t, root_c, chain_with_cols = _trace_to_root(sm, src_t, src_c)
+                # 形如: tmp1(order_id) -> src_orders(order_amount)
+                chain_str = " -> ".join(
+                    f"{t}({c})" for (t, c) in chain_with_cols
+                )
             else:
                 root_t = src_t
+                chain_str = f"{src_t}({src_c})" if src_t else ""
 
             key = (root_t, src_c, lt)
             if key not in seen:
@@ -148,9 +152,12 @@ def _build_mapping_rows(
             elif root_t:
                 src_descs.append(root_t)
 
-        # 合并所有链路
-        chain_descs = [cs for _, _, _, _, cs in src_entries if cs]
-        chain_display = chain_descs[0] if chain_descs else ""
+        # 合并所有链路（derived 字段每个来源独立追溯，全部展示）
+        chain_descs = []
+        for root_t, src_c, lt, expr, cs in src_entries:
+            if cs and not any(c == cs for c in chain_descs):
+                chain_descs.append(cs)
+        chain_display = " | ".join(chain_descs) if chain_descs else ""
 
         # 表达式化简
         expr_display = _substitute_expr_mapping(primary_expr, sm) if primary_expr else ""
@@ -176,21 +183,37 @@ def _trace_to_root(
     src_table: str,
     src_col: str,
     depth: int = 0,
-) -> tuple[str, str, list[str]]:
-    """通过 schema_map 追溯到最上层非 tmp 表"""
+) -> tuple[str, str, list[tuple[str, str]]]:
+    """通过 schema_map 追溯到最上层非 tmp 表，返回 (root_t, root_c, chain_with_cols)。"""
+    # chain_with_cols: [(table_name, col_name), ...]
     if depth > 30 or not src_table:
         return "", "", []
     if not _is_temp_table(src_table):
-        return src_table, src_col, [src_table]
+        return src_table, src_col, [(src_table, src_col)]
     if src_table not in schema_map:
-        return src_table, src_col, [src_table]
+        return src_table, src_col, [(src_table, src_col)]
     src = schema_map[src_table].get_column(src_col)
     if not src or not src.src_table:
-        return src_table, src_col, [src_table]
+        # 回退：检查 referenced_tmp_names
+        all_cands = (
+            schema_map[src_table].source_table_names |
+            schema_map[src_table].get_referenced_tmp_names()
+        )
+        for cand in sorted(all_cands):
+            if cand == src_table or not _is_temp_table(cand):
+                continue
+            if cand in schema_map:
+                cand_src = schema_map[cand].get_column(src_col)
+                if cand_src and cand_src.src_table:
+                    root_t, root_c, tail = _trace_to_root(
+                        schema_map, cand_src.src_table, cand_src.src_column, depth + 1
+                    )
+                    return root_t, root_c, [(cand, src_col)] + tail
+        return src_table, src_col, [(src_table, src_col)]
     root_t, root_c, tail = _trace_to_root(
         schema_map, src.src_table, src.src_column, depth + 1
     )
-    return root_t, root_c, [src_table] + tail
+    return root_t, root_c, [(src_table, src_col)] + tail
 
 
 # ---------------------------------------------------------------
@@ -261,8 +284,8 @@ def to_mapping(result: dict, schema_map: dict = None) -> str:
     out_lines.append("")
 
     # 最小列宽（表头宽度 + 留白）
-    min_widths = [16, 24, 14, 40, 22]
-    header = ["结果字段", "来源(表.字段)", "变换类型", "表达式", "完整链路"]
+    min_widths = [16, 28, 14, 40, 36]
+    header = ["结果字段", "来源(表.字段)", "变换类型", "表达式", "完整链路(表.字段)"]
 
     for tbl_info in result.get("result_tables", []):
         tbl_name = tbl_info["table"]

@@ -79,6 +79,10 @@ def _is_temp_table(name: str) -> bool:
 # Fix 2: 表达式 TMP 前缀替换工具（短名优先 + 从后往前 + 循环直到无变化）
 # ---------------------------------------------------------------
 
+# P0-2: 缓存 tmp_tables 列表，避免每次调用都遍历 schema_map 排序
+_SUBSTITUTE_CACHE: dict[int, list] = {}
+
+
 def _substitute_expr(
     expr: str,
     schema_map: dict,
@@ -92,15 +96,20 @@ def _substitute_expr(
       - 从后往前应用替换，避免字符串位移导致匹配位置错乱
       - 循环直到无变化（max_iter=20），彻底替换所有 tmp 前缀
       - 追溯结果仍为 tmp 时跳过，说明该 tmp 不在 schema_map 中
+      - tmp_tables 缓存到 schema_map 的 id()，避免重复排序
     """
     if not expr or depth > 20:
         return expr
 
-    # 按表名长度升序排列（先短后长）
-    tmp_tables = sorted(
-        [t for t in schema_map.keys() if _is_temp_table(t)],
-        key=len
-    )
+    # P0-2: 缓存 tmp_tables，按 schema_map id 复用
+    cache_key = id(schema_map)
+    if cache_key not in _SUBSTITUTE_CACHE:
+        _SUBSTITUTE_CACHE.clear()
+        _SUBSTITUTE_CACHE[cache_key] = sorted(
+            [t for t in schema_map.keys() if _is_temp_table(t)],
+            key=len
+        )
+    tmp_tables = _SUBSTITUTE_CACHE[cache_key]
 
     result = expr
     changed = True
@@ -197,7 +206,7 @@ def split_by_semicolon(text: str) -> list[str]:
 # 3. 从 SELECT 语句中提取列名列表
 # ---------------------------------------------------------------
 
-def extract_select_columns(select_sql: str) -> list[str]:
+def extract_select_columns(select_sql: str, dialect: str = "postgres") -> list[str]:
     """从 SELECT 语句中提取 SELECT 列表的列名（支持别名）"""
     cols = []
     sql = re.sub(r"(?i)^\s*SELECT\s+", "", select_sql.strip(), count=1)
@@ -244,6 +253,30 @@ def extract_select_columns(select_sql: str) -> list[str]:
         col_name = re.sub(r"\(.*", "", col_name).strip()
         if col_name:
             cols.append(col_name.lower())
+
+    # P0-3: 正则解析失败时（复杂嵌套表达式），fallback 到 sqlglot
+    if not cols and select_sql.strip():
+        try:
+            import sqlglot
+            ast = sqlglot.parse_one(select_sql, dialect=dialect)
+            select_node = ast.find(sqlglot.exp.Select)
+            if select_node:
+                for node in select_node.expressions:
+                    col_name = ""
+                    if isinstance(node, sqlglot.exp.Alias):
+                        col_name = node.alias
+                    elif isinstance(node, sqlglot.exp.Column):
+                        col_name = node.name
+                    elif isinstance(node, sqlglot.exp.Func):
+                        col_name = node.sql_name().lower()
+                    else:
+                        col_name = str(node).split(" AS ")[-1].strip()
+                    col_name = col_name.lower()
+                    if col_name and col_name not in cols:
+                        cols.append(col_name)
+        except Exception:
+            pass
+
     return cols
 
 
@@ -251,10 +284,11 @@ def extract_select_columns(select_sql: str) -> list[str]:
 # 4. 语句解析（识别 DDL 类型）
 # ---------------------------------------------------------------
 
-def split_statements(body: str) -> list[dict]:
+def split_statements(body: str, dialect: str = "postgres") -> list[dict]:
     """
     将存储过程体拆成独立语句。
     body 应为 extract_body() 提取后的纯净过程体。
+    dialect 用于 INSERT INTO 分支预提取 FROM 表名。
     """
     statements = []
     raw_list = split_by_semicolon(body)
@@ -270,7 +304,7 @@ def split_statements(body: str) -> list[dict]:
         if m:
             tbl = m.group(1).strip().strip('"').strip().lower()
             sel = raw[m.end():].strip()
-            cols = extract_select_columns("SELECT " + sel)
+            cols = extract_select_columns("SELECT " + sel, dialect)
             statements.append({
                 "type": "create_as",
                 "table": tbl,
@@ -312,12 +346,15 @@ def split_statements(body: str) -> list[dict]:
         if m:
             tbl = m.group(1).strip().strip('"').strip().lower()
             sel = raw[m.end():].strip()
-            cols = extract_select_columns("SELECT " + sel)
+            cols = extract_select_columns("SELECT " + sel, dialect)
+            # P1-7: 预提取 INSERT INTO SELECT 中的 FROM 表名
+            _, _, src_tables = _build_select_expanded({}, sel, tbl, dialect)
             statements.append({
                 "type": "insert_into",
                 "table": tbl,
                 "select": sel,
                 "cols": cols,
+                "source_table_names": src_tables,
             })
             continue
     return statements
@@ -542,13 +579,15 @@ def build_schema_map(stmts: list[dict], dialect: str = "postgres") -> dict[str, 
             return fm.group(1).lower()
         return ""
 
-    def _process_select_stmt(tbl_name: str, select_sql: str, explicit_cols: list):
+    def _process_select_stmt(tbl_name: str, select_sql: str, explicit_cols: list, pre_extracted_src: set = None):
         """处理 CREATE AS 或 INSERT INTO SELECT 的共用逻辑"""
         _ensure_table(tbl_name)
         _table_alias_map, expanded_sql, all_src = _build_select_expanded(
             schema_map, select_sql, tbl_name, dialect
         )
         schema_map[tbl_name].source_table_names.update(all_src)
+        if pre_extracted_src:
+            schema_map[tbl_name].source_table_names.update(pre_extracted_src)
 
         # Fix 5: 补充 scalar subquery 中的 tmp 表
         referenced_tmp = _extract_referenced_tmp_tables(schema_map, select_sql)
@@ -631,14 +670,14 @@ def build_schema_map(stmts: list[dict], dialect: str = "postgres") -> dict[str, 
         stmt_type = stmt["type"]
         tbl_name = stmt["table"]
         if stmt_type == "create_as":
-            _process_select_stmt(tbl_name, stmt["select"], stmt.get("cols"))
+            _process_select_stmt(tbl_name, stmt["select"], stmt.get("cols"), stmt.get("source_table_names"))
         elif stmt_type == "create_def":
             _ensure_table(tbl_name)
             for col in stmt.get("cols", []):
                 cs = ColumnSource("", "", direct=False)
                 schema_map[tbl_name].add_column(col, cs)
         elif stmt_type == "insert_into":
-            _process_select_stmt(tbl_name, stmt["select"], stmt.get("cols"))
+            _process_select_stmt(tbl_name, stmt["select"], stmt.get("cols"), stmt.get("source_table_names"))
 
     return schema_map
 
@@ -851,7 +890,7 @@ class ProcedureLineageParser:
         """返回 (result_dict, schema_map)"""
         raw = conn.get_procedure_source(proc_name, schema)
         body = extract_body(raw)
-        stmts = split_statements(body)
+        stmts = split_statements(body, self.dialect)
         schema_map = build_schema_map(stmts, self.dialect)
         result_tables = [t for t in schema_map if not _is_temp_table(t)]
         result_tables_lineage = []
@@ -928,7 +967,7 @@ def _resolve_cross_procedure(
     visited.add(creating_proc)
     raw = conn.get_procedure_source(creating_proc, "public")
     body = extract_body(raw)
-    stmts = split_statements(body)
+    stmts = split_statements(body, dialect)
     sub_schema_map = build_schema_map(stmts, dialect)
     # 对子过程 schema_map 再次触发跨过程追溯，补全子过程中引用的 tmp 的来源
     _resolve_all_cross_procedures(
@@ -1010,7 +1049,7 @@ class ProcedureLineageParserV2:
         visited: set = set()
         raw = conn.get_procedure_source(proc_name, schema)
         body = extract_body(raw)
-        stmts = split_statements(body)
+        stmts = split_statements(body, self.dialect)
         schema_map = build_schema_map(stmts, self.dialect)
         _resolve_all_cross_procedures(
             schema_map, proc_name,
