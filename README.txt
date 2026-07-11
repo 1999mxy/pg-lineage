@@ -81,6 +81,7 @@ Codex 会自动读取此 skill 并调用 run.py 执行。
   --dialect        SQL 方言：postgres / oracle / mysql / tsql，默认 postgres
   --cross-proc     启用跨存储过程追溯
   --validate-registry  启用来源表注册校验
+  --registry-table   注册表表名（默认 lineage_source_table_registry，可按库配置）
 
 
 四、输出格式
@@ -117,6 +118,7 @@ Codex 会自动读取此 skill 并调用 run.py 执行。
       ('src_orders'), ('src_orders_detail'),
       ('src_product'), ('src_product_inventory');
 
+表名可通过 --registry-table 参数自定义，不同数据库可用不同的注册表名。
 这样 --validate-registry 才能正常工作。
 
 
