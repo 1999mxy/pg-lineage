@@ -1,0 +1,1206 @@
+"""
+ProcedureLineageParser: 存储过程字段级血缘分析器
+"""
+
+import re
+import sqlglot
+from typing import Optional
+
+
+class ColumnSource:
+    def __init__(
+        self,
+        src_table: str,
+        src_column: str,
+        direct: bool = True,
+        expression: str = "",
+        is_tmp: bool = False,
+    ):
+        self.src_table = src_table
+        self.src_column = src_column
+        self.direct = direct
+        self.expression = expression
+        self.src_columns: list[tuple[str, str]] = []  # [(来源表, 源列名), ...]
+        self.is_tmp = is_tmp
+
+
+class TempTableSchema:
+    def __init__(self, name: str):
+        self.name = name
+        self.columns: dict[str, ColumnSource] = {}
+        self.source_table_names: set[str] = set()  # 该表 SELECT 中涉及的所有源表名
+
+    def add_column(self, col_name: str, source: ColumnSource):
+        self.columns[col_name.lower()] = source
+
+    def get_column(self, col_name: str) -> Optional[ColumnSource]:
+        return self.columns.get(col_name.lower())
+
+    def get_all_columns(self) -> dict[str, ColumnSource]:
+        return self.columns
+
+
+# ---------------------------------------------------------------
+# 1. 提取过程体（去除 $$ 定界符）
+# ---------------------------------------------------------------
+
+def extract_body(source: str) -> str:
+    """提取 PostgreSQL 存储过程体，去除 $$ 定界符"""
+    # 带 tag 的 $tag$...$tag$
+    m = re.search(r'\$([a-zA-Z_]*)\$(.+?)\$\1\$', source, re.DOTALL)
+    if m:
+        return m.group(2)
+    # 简单 $$...$$
+    m = re.search(r'\$\$(.+?)\$\$', source, re.DOTALL)
+    if m:
+        return m.group(1)
+    return source
+
+
+# ---------------------------------------------------------------
+# 2. 语句切分（按分号，支持括号嵌套）
+# ---------------------------------------------------------------
+
+def split_by_semicolon(text: str) -> list[str]:
+    """按分号切分语句，忽略字符串和括号内的分号"""
+    statements = []
+    depth = 0
+    current = ""
+    i = 0
+    while i < len(text):
+        ch = text[i]
+
+        # 跳过字符串字面量
+        if ch in ("'", '"'):
+            quote = ch
+            current += ch
+            i += 1
+            while i < len(text):
+                if text[i] == quote and (i == 0 or text[i-1] != '\\'):
+                    current += text[i]
+                    i += 1
+                    break
+                current += text[i]
+                i += 1
+            continue
+
+        # 跳过 -- 注释
+        if text[i:i+2] == "--":
+            current += text[i]
+            i += 1
+            while i < len(text) and text[i] != "\n":
+                current += text[i]
+                i += 1
+            continue
+
+        # 跳过 /* */ 注释
+        if text[i:i+2] == "/*":
+            end = text.find("*/", i+2)
+            if end >= 0:
+                i = end + 2
+                continue
+            else:
+                break
+
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == ";" and depth == 0:
+            stmt = current.strip()
+            if stmt:
+                statements.append(stmt)
+            current = ""
+            i += 1
+            continue
+
+        current += ch
+        i += 1
+
+    last = current.strip()
+    if last:
+        statements.append(last)
+
+    return statements
+
+
+# ---------------------------------------------------------------
+# 3. 从 SELECT 列表中提取列名（不含表前缀）
+# ---------------------------------------------------------------
+
+def split_outside_parens(text: str, sep: str) -> list[str]:
+    parts = []
+    depth = 0
+    current = ""
+    for ch in text:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == sep and depth == 0:
+            parts.append(current)
+            current = ""
+            continue
+        current += ch
+    parts.append(current)
+    return parts
+
+
+def extract_select_columns(sql: str) -> list[str]:
+    """
+    从 SELECT ... FROM sql 中提取列名。
+    sql 必须是完整的 SELECT ... FROM 语句。
+    """
+    cols = []
+    m = re.search(r"(?i)\bSELECT\s+(.*?)\bFROM\b", sql, re.DOTALL)
+    if not m:
+        return cols
+    select_part = m.group(1)
+    parts = split_outside_parens(select_part, ",")
+
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+
+        # 提取 AS 别名
+        as_m = re.search(r"(?i)\bAS\s+(\S+)$", part)
+        if as_m:
+            alias = as_m.group(1).strip().strip('"').strip()
+            cols.append(alias.lower())
+            continue
+
+        # 无 AS：取最后一个单词，去掉表前缀
+        words = part.split()
+        last_word = words[-1] if words else part
+        if "." in last_word:
+            col_name = last_word.rsplit(".", 1)[-1].strip()
+        else:
+            col_name = last_word.strip()
+        col_name = re.sub(r"\(.*", "", col_name).strip()
+
+        if col_name:
+            cols.append(col_name.lower())
+
+    return cols
+
+
+# ---------------------------------------------------------------
+# 4. 语句解析（识别 DDL 类型）
+# ---------------------------------------------------------------
+
+def split_statements(body: str) -> list[dict]:
+    """
+    将存储过程体拆成独立语句。
+    body 应为 extract_body() 提取后的纯净过程体。
+    """
+    statements = []
+    raw_list = split_by_semicolon(body)
+
+    for raw in raw_list:
+        raw = raw.strip()
+        if not raw:
+            continue
+
+        # CREATE [TEMP] TABLE xxx AS SELECT ...
+        m = re.search(
+            r"(?i)\bCREATE\s+(?:TEMP\s+)?TABLE\s+(\S+)\s+AS\s+SELECT",
+            raw,
+        )
+        if m:
+            tbl = m.group(1).strip().strip('"').strip().lower()
+            sel = raw[m.end():].strip()
+            cols = extract_select_columns("SELECT " + sel)
+            statements.append({
+                "type": "create_as",
+                "table": tbl,
+                "select": sel,
+                "cols": cols,
+            })
+            continue
+
+        # CREATE [TEMP] TABLE xxx (col_list) — 用括号匹配找列定义
+        m = re.search(
+            r"(?i)\bCREATE\s+(?:TEMP\s+)?TABLE\s+(\S+)",
+            raw,
+        )
+        if m:
+            tbl = m.group(1).strip().strip('"').strip().lower()
+            rest = raw[m.end():].strip()
+            if rest.startswith("("):
+                # 找匹配的右括号
+                depth, end_idx = 0, 0
+                for i, ch in enumerate(rest):
+                    if ch == "(":
+                        depth += 1
+                    elif ch == ")":
+                        depth -= 1
+                        if depth == 0:
+                            end_idx = i
+                            break
+                col_str = rest[1:end_idx]
+                cols = [
+                    c.strip().split()[0].strip().strip('"').lower()
+                    for c in col_str.split(",") if c.strip()
+                ]
+                statements.append({
+                    "type": "create_def",
+                    "table": tbl,
+                    "cols": cols,
+                })
+                continue
+
+        # INSERT INTO xxx SELECT ...
+        m = re.search(r"(?i)\bINSERT\s+INTO\s+(\S+)\s+SELECT", raw)
+        if m:
+            tbl = m.group(1).strip().strip('"').strip().lower()
+            sel = raw[m.end():].strip()
+            cols = extract_select_columns("SELECT " + sel)
+            statements.append({
+                "type": "insert_into",
+                "table": tbl,
+                "select": sel,
+                "cols": cols,
+            })
+            continue
+
+    return statements
+
+
+# ---------------------------------------------------------------
+# 5. sqlglot 解析 SELECT → 列来源（含派生字段检测）
+# ---------------------------------------------------------------
+
+def _walk_columns(expr):
+    """递归提取表达式中的所有 Column 节点（含别名内部）"""
+    cols = []
+    if isinstance(expr, sqlglot.exp.Alias):
+        # 别名：只取其表达式部分的 Column，不取别名本身
+        cols.extend(_walk_columns(expr.this))
+    elif isinstance(expr, sqlglot.exp.Column):
+        cols.append(expr)
+    elif hasattr(expr, "walk"):
+        # 使用 sqlglot 内置 walk 递归遍历所有子节点
+        for node in expr.walk():
+            if isinstance(node, sqlglot.exp.Column) and node is not expr:
+                cols.append(node)
+    elif hasattr(expr, "expressions"):
+        for sub in expr.expressions:
+            cols.extend(_walk_columns(sub))
+    return cols
+
+
+def _is_derived_expr(expr) -> bool:
+    """
+    判断 SELECT 表达式是否为派生表达式。
+    简单列引用（Column 节点本身）返回 False。
+    包含函数、运算、CASE 等的表达式返回 True。
+    """
+    # Column 节点本身：直接列引用
+    if isinstance(expr, sqlglot.exp.Column):
+        return False
+    # 别名内部是 Column：仍然是直接引用
+    if isinstance(expr, sqlglot.exp.Alias) and isinstance(expr.this, sqlglot.exp.Column):
+        return False
+    # 其余均为派生表达式
+    return True
+
+
+def parse_select(sql: str, dialect: str = "postgres") -> dict[str, dict]:
+    """
+    解析 SELECT 语句，返回 { 输出列名: {
+        "src_table": 来源表（主要来源，临时表优先）,
+        "src_column": 源列名,
+        "is_derived": 是否派生表达式,
+        "src_columns": [(来源表, 源列名), ...]  表达式中所有参与列,
+    }}。
+    """
+    result = {}
+    try:
+        ast = sqlglot.parse_one(sql, dialect=dialect)
+    except Exception:
+        return result
+
+    # 建立别名 → 表名 映射
+    alias_map: dict[str, str] = {}
+    for node in ast.walk():
+        if isinstance(node, (sqlglot.exp.From, sqlglot.exp.Join)):
+            tbl = node.find(sqlglot.exp.Table)
+            if tbl:
+                tbl_name = tbl.name.lower()
+                alias = (tbl.alias or tbl_name).lower()
+                alias_map[alias] = tbl_name
+
+    def resolve_table(tbl_alias: str) -> str:
+        if not tbl_alias:
+            return ""
+        return alias_map.get(tbl_alias.lower(), tbl_alias.lower())
+
+    # 只取 SELECT 列表中的列
+    sel_node = ast.find(sqlglot.exp.Select)
+    if sel_node and hasattr(sel_node, "expressions"):
+        for expr in sel_node.expressions:
+            # 判断是否有 AS 别名
+            if isinstance(expr, sqlglot.exp.Alias):
+                out_col_name = expr.alias.lower()
+            else:
+                out_col_name = None
+
+            # 判断是否为派生表达式
+            is_derived = _is_derived_expr(expr)
+
+            # 收集所有列节点
+            col_nodes = _walk_columns(expr)
+
+            # 构建 src_columns 列表
+            src_columns = []
+            for col_node in col_nodes:
+                real_col_name = col_node.name.lower()
+                src_table = resolve_table(col_node.table)
+                src_columns.append((src_table, real_col_name))
+
+            # 确定主来源（用于 direct 字段的 is_tmp 判断）
+            # 优先级：临时表 > 真实表
+            primary_src_table = ""
+            primary_src_col = ""
+            if src_columns:
+                for (st, sc) in src_columns:
+                    if re.match(r'^tmp', st):
+                        primary_src_table = st
+                        primary_src_col = sc
+                        break
+                if not primary_src_table:
+                    primary_src_table, primary_src_col = src_columns[0]
+
+            # 确定输出列名
+            if out_col_name is not None:
+                col_name = out_col_name
+            elif col_nodes:
+                col_name = col_nodes[0].name.lower()
+            else:
+                col_name = ""
+
+            # 提取表达式文本（不含 AS 别名）
+            if isinstance(expr, sqlglot.exp.Alias):
+                expr_text = expr.this.sql(dialect=dialect)
+            else:
+                expr_text = expr.sql(dialect=dialect)
+
+            if col_name:
+                result[col_name] = {
+                    "src_table": primary_src_table,
+                    "src_column": primary_src_col,
+                    "is_derived": is_derived,
+                    "src_columns": src_columns,
+                    "expression": expr_text,
+                }
+
+    return result
+
+
+# ---------------------------------------------------------------
+# 6. 构建 Schema Map（正向）
+# ---------------------------------------------------------------
+SQL_KW = frozenset({
+    "as", "on", "and", "or", "not", "in", "is", "null", "true", "false",
+    "join", "inner", "outer", "left", "right", "full", "cross", "natural",
+    "where", "order", "by", "group", "having", "limit", "offset", "over",
+    "partition", "window", "using", "between", "like", "ilike", "any", "some",
+    "exists", "case", "when", "then", "else", "end", "cast", "coalesce",
+    "distinct", "all", "union", "intersect", "except",
+})
+# 符号/操作符列表
+OPERATOR_TOKENS = frozenset({"=", ",", "+", "-", "*", "/", "<", ">", "<=", ">=", "<>", "!=", ";", "(", ")"})
+
+
+def _expand_subquery_columns(select_sql: str, alias_map: dict[str, str], dialect: str) -> dict[str, dict]:
+    """
+    展开 SELECT 中的子查询列引用，将 t.列 中的 t 替换为子查询内层真实表。
+    alias_map: { 子查询别名 -> 对应的真实表名 }
+    返回: { 列名 -> { "src_table": 真实表名, "src_column": 列名, ... } }
+    直接修改 col_map 中的 src_table。
+    """
+    import sqlglot
+    result = {}
+    try:
+        ast = sqlglot.parse_one(select_sql, dialect=dialect)
+    except Exception:
+        return result
+
+    # 先建立 FROM/JOIN 表名→别名 的映射
+    table_alias: dict[str, str] = {}  # 表名 → 别名
+    alias_to_table: dict[str, str] = {}  # 别名 → 表名
+    for node in ast.walk():
+        if isinstance(node, (sqlglot.exp.From, sqlglot.exp.Join)):
+            tbl = node.find(sqlglot.exp.Table)
+            if tbl:
+                tbl_name = tbl.name.lower()
+                alias = (tbl.alias or tbl_name).lower()
+                table_alias[tbl_name] = alias
+                alias_to_table[alias] = tbl_name
+
+    # 对 alias_map 中记录的子查询别名，展开其内部的真实表
+    # alias_map: { alias -> 真实表名 }
+    # 扫描 SELECT 表达式，如果列引用了子查询别名，就替换为真实表
+    sel_node = ast.find(sqlglot.exp.Select)
+    if not sel_node or not hasattr(sel_node, "expressions"):
+        return result
+
+    for expr in sel_node.expressions:
+        _walk_and_expand_expr(expr, alias_to_table, alias_map)
+
+    # 重新用 parse_select 解析（但这次 alias_map 已更新）
+    # 不，直接在现有 col_map 上做展开
+    return result
+
+
+def _walk_and_expand_expr(expr, alias_to_table, alias_map):
+    """递归展开 expr 中的 Column 节点，将子查询别名替换为真实表名"""
+    import sqlglot
+    if isinstance(expr, sqlglot.exp.Alias):
+        _walk_and_expand_expr(expr.this, alias_to_table, alias_map)
+    elif isinstance(expr, sqlglot.exp.Column):
+        tbl_alias = (expr.table or "").lower()
+        if tbl_alias in alias_map:
+            # 替换为真实表名
+            real_table = alias_map[tbl_alias]
+            expr.args["table"] = real_table
+    elif hasattr(expr, "walk"):
+        for node in expr.walk():
+            if isinstance(node, sqlglot.exp.Column):
+                tbl_alias = (node.table or "").lower()
+                if tbl_alias in alias_map:
+                    node.args["table"] = alias_map[tbl_alias]
+    elif hasattr(expr, "expressions"):
+        for sub in expr.expressions:
+            _walk_and_expand_expr(sub, alias_to_table, alias_map)
+
+def _record_source_tables(schema_map: dict, select_sql: str, target_table: str, dialect: str):
+    """
+    从 SELECT SQL 中提取所有 tmp 表名（含跨过程追溯时识别子过程的临时表引用）。
+    同时记录 alias_map：别名 -> 真实表名。
+    """
+    clean = re.sub(r"--.*$", "", select_sql, flags=re.MULTILINE)
+    from_m = re.search(r"\bFROM\b", clean, re.IGNORECASE)
+    if not from_m:
+        return
+    rest = clean[from_m.end():].strip()
+    kw_pattern = re.compile(r"\b(WHERE|OVER)\b", re.IGNORECASE)
+    km = kw_pattern.search(rest)
+    if km:
+        rest = rest[:km.start()].strip()
+
+    tables: list[str] = []
+    alias_map: dict[str, str] = {}
+    # all_source_tables: 记录所有源表（用于跨过程追溯时识别子过程的 tmp 表引用）
+    all_source_tables: set[str] = set()
+
+    def _scan_segment(segment: str):
+        """扫描一段 FROM/JOIN 后的内容，提取表名和子查询"""
+        pos = 0
+        while pos < len(segment):
+            ch = segment[pos]
+
+            # 跳过空白
+            if ch in " \t\n\r":
+                pos += 1
+                continue
+
+            if ch == "(":
+                # 子查询：找匹配的右括号
+                depth, i = 1, pos + 1
+                while i < len(segment) and depth > 0:
+                    if segment[i] == "(":
+                        depth += 1
+                    elif segment[i] == ")":
+                        depth -= 1
+                    i += 1
+                subq_body = segment[pos+1:i-1].strip()
+
+                # 子查询后面的内容（可能是别名）
+                rest_after = segment[i:].lstrip()
+                alias = ""
+                alias_m = re.match(r"(?i)(?:AS\s+)?([\w_][\w0-9_]*)", rest_after)
+                if alias_m:
+                    alias = alias_m.group(1).lower()
+
+                # 从子查询体内提取真实源表
+                inner_tables: list[str] = []
+                # 找主表 FROM
+                inner_from = re.search(r"(?i)\bFROM\b\s+([\w_][\w0-9_]*)", subq_body)
+                if inner_from:
+                    inner_tables.append(inner_from.group(1).lower())
+                # 找 JOIN 表
+                for jm in re.finditer(r"(?i)\bJOIN\b\s+([\w_][\w0-9_]*)", subq_body):
+                    inner_tables.append(jm.group(1).lower())
+
+                # 记录别名（如果有别名指向第一张表）
+                if alias and inner_tables:
+                    alias_map[alias] = inner_tables[0]
+
+                # 记录所有源表（用于跨过程追溯时识别子过程的 tmp 表引用）
+                for it in inner_tables:
+                    all_source_tables.add(it)
+
+                pos = i
+                continue
+
+            # 普通表名
+            tbl_m = re.match(r"([\w_][\w0-9_]*)(?:\s+(?:AS\s+)?([\w_][\w0-9_]*))?", segment[pos:], re.IGNORECASE)
+            if tbl_m:
+                tbl = tbl_m.group(1).lower()
+                als = tbl_m.group(2)
+                tables.append(tbl)
+                if als:
+                    alias_map[als.lower()] = tbl
+                pos += tbl_m.end()
+                continue
+
+            pos += 1
+
+    # 先处理 FROM 后的第一段（主表）
+    # 找第一个 JOIN 之前的内容
+    first_join_m = re.search(r"(?i)\bJOIN\b", rest)
+    if first_join_m:
+        from_segment = rest[:first_join_m.start()]
+        join_segments_start = first_join_m.end()
+    else:
+        from_segment = rest
+        join_segments_start = None
+
+    _scan_segment(from_segment)
+
+    # 处理每个 JOIN
+    if join_segments_start is not None:
+        remaining = rest[join_segments_start:]
+        # 逐个找 JOIN
+        for jm in re.finditer(r"(?i)\bJOIN\b", remaining):
+            after_join = remaining[jm.end():].lstrip()
+            # 找这个 JOIN 后的下一段（到下一个 JOIN 或结束）
+            next_jm = re.search(r"(?i)\bJOIN\b", after_join)
+            if next_jm:
+                join_segment = after_join[:next_jm.start()]
+                remaining = after_join[next_jm.start():]
+            else:
+                join_segment = after_join
+                remaining = ""
+            _scan_segment(join_segment)
+
+    # 用别名映射展开
+    final_tables: set[str] = set()
+    for t in tables:
+        if t in alias_map:
+            final_tables.add(alias_map[t])
+        else:
+            final_tables.add(t)
+
+    # 记录所有源表（包括普通表 JOIN 和子查询中的表）
+    all_source_tables.update(final_tables)
+
+    if target_table in schema_map:
+        schema_map[target_table].source_table_names.update(all_source_tables)
+
+
+
+
+def _detect_from_table(select_sql: str) -> str:
+    """从 SELECT SQL 中提取 FROM 子句的主表名（支持别名）"""
+    import re
+    # 先去掉注释和字符串字面量
+    sql_text = re.sub(r"--.*$", "", select_sql, flags=re.MULTILINE)
+    # 找 FROM 关键字
+    m = re.search(r"\bFROM\b", sql_text, re.IGNORECASE)
+    if not m:
+        return ""
+    rest = sql_text[m.end():].strip()
+    # 逐字符扫描，跳过括号内容，匹配表名关键字
+    keyword_pattern = re.compile(
+        r"\b((LEFT|RIGHT|INNER|CROSS)?\s*JOIN|OVER|WHERE|ORDER\s+BY|GROUP\s+BY|HAVING|LIMIT|OFFSET)\b",
+        re.IGNORECASE
+    )
+    km = keyword_pattern.search(rest)
+    if km:
+        rest = rest[:km.start()].strip()
+    # 取第一个词（表名，可能带 schema）
+    parts = rest.split()
+    if parts:
+        tbl = parts[0].strip('",;()')
+        tbl = tbl.split(".")[-1]  # 去掉 schema 前缀
+        return tbl.lower()
+    return ""
+
+def build_schema_map(statements: list[dict], dialect: str) -> dict[str, TempTableSchema]:
+    """
+    遍历语句序列，正向构建所有临时表的字段 Schema Map。
+    """
+    schema_map: dict[str, TempTableSchema] = {}
+
+    for stmt in statements:
+        tbl_name = stmt["table"]
+        stmt_type = stmt["type"]
+
+        if tbl_name not in schema_map:
+            schema_map[tbl_name] = TempTableSchema(tbl_name)
+
+        if stmt_type == "create_as":
+            col_map = parse_select("SELECT " + stmt["select"], dialect)
+            # Expand * wildcard: directly copy ColumnSource from source table
+            cols_to_process = []
+            star_sources = {}  # col_name -> ColumnSource from source table
+            for col in stmt.get("cols", []):
+                if col == "*":
+                    src_tbl = _detect_from_table(stmt["select"])
+                    if src_tbl and src_tbl in schema_map:
+                        for inherited_col, inherited_src in schema_map[src_tbl].get_all_columns().items():
+                            if inherited_col not in cols_to_process:
+                                cols_to_process.append(inherited_col)
+                                star_sources[inherited_col] = inherited_src
+                    elif src_tbl and re.match(r'^src_', src_tbl):
+                        pass
+                else:
+                    if col not in cols_to_process:
+                        cols_to_process.append(col)
+            # 记录该 CREATE AS 的所有源表名（用于跨过程追溯）
+            _record_source_tables(schema_map, stmt["select"], tbl_name, dialect)
+            for col in cols_to_process:
+                key = col.lower()
+                entry = None
+                if key in col_map:
+                    entry = col_map[key]
+                else:
+                    # 列名不在 col_map 中（如别名场景）：按底层列名查找
+                    for v_key, v_entry in col_map.items():
+                        if any(sc[1].lower() == key for sc in v_entry["src_columns"]):
+                            entry = v_entry
+                            break
+
+                if col in star_sources:
+                    # * expanded column: directly use the ColumnSource from source table
+                    schema_map[tbl_name].add_column(col, star_sources[col])
+                    continue
+
+                if col in star_sources:
+                    schema_map[tbl_name].add_column(col, star_sources[col])
+                    continue
+
+                if entry:
+                    src_table = entry["src_table"]
+                    src_col = entry["src_column"]
+                    is_derived = entry["is_derived"]
+                    src_cols = entry["src_columns"]
+                    expr_text = entry.get("expression", "")
+                else:
+                    src_table, src_col, is_derived = "", col, False
+                    src_cols = []
+                    expr_text = ""
+
+                if not is_derived and src_table and re.match(r'^tmp', src_table):
+                    if src_table in schema_map:
+                        prev = schema_map[src_table].get_column(src_col)
+                        if prev and not prev.direct:
+                            is_derived = True
+                            src_cols = prev.src_columns or [(src_table, src_col)]
+
+                is_tmp = bool(re.match(r'^tmp', src_table)) if src_table else False
+                cs = ColumnSource(src_table, src_col, direct=not is_derived, is_tmp=is_tmp)
+                cs.src_columns = src_cols
+                cs.expression = expr_text
+                schema_map[tbl_name].add_column(col, cs)
+
+        elif stmt_type == "create_def":
+            for col in stmt.get("cols", []):
+                cs = ColumnSource("", "", direct=False)
+                schema_map[tbl_name].add_column(col, cs)
+
+        elif stmt_type == "insert_into":
+            col_map = parse_select("SELECT " + stmt["select"], dialect)
+            # Expand * wildcard: directly copy ColumnSource from source table
+            # 记录该 INSERT INTO 的所有源表名（用于跨过程追溯）
+            _record_source_tables(schema_map, stmt["select"], tbl_name, dialect)
+            insert_cols = []
+            star_sources = {}
+            for col in stmt.get("cols", []) or list(col_map.keys()):
+                if col == "*":
+                    src_tbl = _detect_from_table(stmt["select"])
+                    if src_tbl and src_tbl in schema_map:
+                        for inherited_col, inherited_src in schema_map[src_tbl].get_all_columns().items():
+                            if inherited_col not in insert_cols:
+                                insert_cols.append(inherited_col)
+                                star_sources[inherited_col] = inherited_src
+                    elif src_tbl and re.match(r'^src_', src_tbl):
+                        pass
+                else:
+                    if col not in insert_cols:
+                        insert_cols.append(col)
+            for col in insert_cols:
+                key = col.lower()
+                entry = None
+                if key in col_map:
+                    entry = col_map[key]
+                else:
+                    for v_key, v_entry in col_map.items():
+                        if any(sc[1].lower() == key for sc in v_entry["src_columns"]):
+                            entry = v_entry
+                            break
+
+                if col in star_sources:
+                    schema_map[tbl_name].add_column(col, star_sources[col])
+                    continue
+
+                if entry:
+                    src_table = entry["src_table"]
+                    src_col = entry["src_column"]
+                    is_derived = entry["is_derived"]
+                    src_cols = entry["src_columns"]
+                    expr_text = entry.get("expression", "")
+                else:
+                    src_table, src_col, is_derived = "", col, False
+                    src_cols = []
+                    expr_text = ""
+
+                if not is_derived and src_table and re.match(r'^tmp', src_table):
+                    if src_table in schema_map:
+                        prev = schema_map[src_table].get_column(src_col)
+                        if prev and not prev.direct:
+                            is_derived = True
+                            src_cols = prev.src_columns or [(src_table, src_col)]
+
+                is_tmp = bool(re.match(r'^tmp', src_table)) if src_table else False
+                cs = ColumnSource(src_table, src_col, direct=not is_derived, is_tmp=is_tmp)
+                cs.src_columns = src_cols
+                cs.expression = expr_text
+                schema_map[tbl_name].add_column(col, cs)
+
+    return schema_map
+
+
+# ---------------------------------------------------------------
+# 7. 血缘追溯（逆向）
+# ---------------------------------------------------------------
+
+def _resolve_alias(schema_map: dict[str, TempTableSchema], table: str, col: str) -> tuple[str, str]:
+    """尝试在 schema_map 中解析 table.col，返回 (src_table, src_col)"""
+    if table.lower() in schema_map:
+        src = schema_map[table.lower()].get_column(col)
+        if src and src.src_table:
+            return src.src_table, src.src_column
+    return table, col
+
+
+def _trace_column(
+    schema_map: dict[str, TempTableSchema],
+    src_table: str,
+    src_col: str,
+    depth: int = 0,
+    visited_aliases: set = None,
+) -> tuple[str, str, list[str], None]:
+    """
+    递归追溯单个列至最上层来源表。
+    遇到非 tmp 表（子查询别名等）时，从 tmp 表的 src_columns 中找引用它的列，
+    继续向上追溯。visited_aliases 防止循环。
+    返回 (最上层表, 最上层列, 链路列表, None)。
+    """
+    if visited_aliases is None:
+        visited_aliases = set()
+
+    if depth > 20:
+        return src_table, src_col, [src_table] if src_table else [], None
+
+    if not src_table:
+        return "", "", [], None
+
+    # tmp 表：正常递归追溯
+    if re.match(r"^tmp", src_table) and src_table in schema_map:
+        src = schema_map[src_table].get_column(src_col)
+        if src and src.src_table:
+            next_tbl, next_col = src.src_table, src.src_column
+            root_t, root_c, chain_tail, _ = _trace_column(schema_map, next_tbl, next_col, depth + 1, visited_aliases)
+            return root_t, root_c, [src_table] + chain_tail, None
+        return src_table, src_col, [src_table], None
+
+    # 非 tmp 表或不在 schema_map（子查询别名）
+    if src_table in visited_aliases:
+        return src_table, src_col, [src_table], None
+    visited_aliases.add(src_table)
+
+    # 优先：如果 src_table 在 schema_map 中（非 tmp），直接递归追溯其 src
+    if src_table in schema_map:
+        src = schema_map[src_table].get_column(src_col)
+        if src and src.src_table:
+            root_t, root_c, chain_tail, _ = _trace_column(schema_map, src.src_table, src.src_column, depth + 1, visited_aliases)
+            return root_t, root_c, [src_table] + chain_tail, None
+
+    # 不在 schema_map（子查询别名）：在 tmp 表中找引用了 src_table.src_col 的表
+    for parent_tbl in schema_map:
+        if not re.match(r"^tmp", parent_tbl):
+            continue
+        cs = schema_map[parent_tbl].get_column(src_col)
+        if cs and cs.src_table == src_table:
+            # parent_tbl.src_col 引用了 src_table.src_col
+            # 递归追溯 parent_tbl.src_col 的上游（跳过 parent 搜索，避免循环）
+            if re.match(r"^tmp", parent_tbl) and parent_tbl in schema_map:
+                upstream = schema_map[parent_tbl].get_column(src_col)
+                if upstream and upstream.src_table:
+                    # 向上追溯，但通过 tmp 分支处理，不走非 tmp 搜索
+                    root_t, root_c, chain_tail, _ = _trace_column(schema_map, upstream.src_table, upstream.src_column, depth + 1, visited_aliases)
+                    return root_t, root_c, [src_table, parent_tbl] + chain_tail, None
+            return src_table, src_col, [src_table], None
+
+    return src_table, src_col, [src_table], None
+
+
+def trace_lineage(schema_map: dict[str, TempTableSchema], result_table: str) -> list[dict]:
+    lineage = []
+    if result_table.lower() not in schema_map:
+        return lineage
+    result_schema = schema_map[result_table.lower()]
+    for col_name, col_source in result_schema.get_all_columns().items():
+        lineage.extend(
+            _trace_single(schema_map, result_table.lower(), col_name, col_source)
+        )
+    return lineage
+
+
+def _is_simple_column_ref(expr: str) -> bool:
+    """判断 expression 是否只是简单列引用（不含任何运算/函数）"""
+    if not expr:
+        return False
+    # 简单列引用：只含字母数字下划线和小数点，无空格、无运算符
+    import re
+    # 去掉表别名后只剩列名
+    stripped = re.sub(r"\b[A-Za-z_]\w*\.", "", expr).strip()
+    # 如果剩余部分只是标识符，就是简单列引用
+    return bool(stripped) and re.match(r"^[A-Za-z_]\w*$", stripped)
+
+
+def _fill_expr_from_chain(schema_map: dict, src_table: str, src_col: str, depth: int = 0) -> str:
+    """递归从上游临时表链回溯 expression"""
+    if depth > 20 or not src_table:
+        return ""
+    if not re.match(r"^tmp", src_table):
+       return ""
+    if src_table not in schema_map:
+        return ""
+    upstream = schema_map[src_table].get_column(src_col)
+    if not upstream:
+        return ""
+    e = getattr(upstream, "expression", "") or ""
+    if e:
+        return e
+    # 继续向上追溯
+    if upstream.src_table:
+        return _fill_expr_from_chain(schema_map, upstream.src_table, upstream.src_column, depth + 1)
+    return ""
+
+
+def _trace_single(
+    schema_map: dict[str, TempTableSchema],
+    table_name: str,
+    col_name: str,
+    col_source: ColumnSource,
+) -> list[dict]:
+    """
+    追溯单个字段的血缘。
+    直接字段返回单条记录；派生字段对每个参与列各返回一条记录。
+    返回值始终为 list（1 条或多条）。
+    """
+    if not col_source.src_table:
+        return [_make_record(col_name, "", "", "direct", [], "")]
+
+    # 收集当前列的 expression（可能为空）
+    expr = getattr(col_source, "expression", "") or ""
+
+    # 如果 expression 为空，或者是简单的列引用（不含运算符/函数），尝试从上游回溯
+    is_meaningful_expr = bool(expr) and not _is_simple_column_ref(expr)
+    if not is_meaningful_expr and col_source.src_table:
+        upstream_expr = _fill_expr_from_chain(schema_map, col_source.src_table, col_source.src_column)
+        if upstream_expr:
+            expr = upstream_expr
+
+    if col_source.direct:
+        # 直接列引用：单条追溯记录
+        root_table, root_col, chain, _ = _trace_column(
+            schema_map, col_source.src_table, col_source.src_column
+        )
+        chain_str = " → ".join(chain)
+        # Chain 过滤：去掉末尾非 tmp 的表（子查询别名等）
+        filtered = list(chain)
+        while filtered and not re.match(r"^tmp", filtered[-1]):
+            filtered.pop()
+        chain_str = " → ".join(filtered) if filtered else ""
+        # root_table/root_col 也更新为过滤后 chain 最后一跳的追溯结果
+        if filtered:
+            root_table, root_col, _, _ = _trace_column(schema_map, filtered[-1], col_name)
+        return [_make_record(col_name, root_table, root_col, "direct", [], chain_str, expr)]
+
+    # 派生表达式：每个参与列各一条追溯记录
+    records = []
+    for (src_t, src_c) in col_source.src_columns:
+        root_table, root_col, chain, _ = _trace_column(schema_map, src_t, src_c)
+        # Chain 过滤：去掉末尾非 tmp 的表（子查询别名等）
+        filtered = list(chain) if chain else []
+        while filtered and not re.match(r"^tmp", filtered[-1]):
+            filtered.pop()
+        chain_str = " → ".join(filtered) if filtered else ""
+        # root_table/root_col 更新为过滤后 chain 最后一跳的追溯结果
+        if filtered:
+            root_table, root_col, _, _ = _trace_column(schema_map, filtered[-1], src_c)
+        records.append(_make_record(col_name, root_table, root_col, "derived", [], chain_str, expr))
+
+    return records
+
+
+def _make_record(col_name, src_table, src_column, lineage_type, src_columns, chain_str, expression=""):
+    return {
+        "result_column": col_name,
+        "src_schema": "public",
+        "src_table": src_table,
+        "src_column": src_column,
+        "lineage_type": lineage_type,
+        "expression": expression,
+        "chain": chain_str,
+    }
+
+
+# ---------------------------------------------------------------
+# 主解析器
+# ---------------------------------------------------------------
+
+class ProcedureLineageParser:
+    def __init__(self, db_type: str = "postgresql", dialect: str = "postgres"):
+        self.db_type = db_type
+        self.dialect = dialect
+
+    def parse(self, proc_name: str, schema: str, conn) -> dict:
+        result, _ = self.parse_full(proc_name, schema, conn)
+        return result
+
+    def parse_full(self, proc_name: str, schema: str, conn) -> tuple[dict, dict]:
+        """返回 (result_dict, schema_map)"""
+        raw = conn.get_procedure_source(proc_name, schema)
+        body = extract_body(raw)
+        stmts = split_statements(body)
+        schema_map = build_schema_map(stmts, self.dialect)
+
+        result_tables = [t for t in schema_map if not re.match(r'^tmp', t)]
+
+        result_tables_lineage = []
+        for tbl in result_tables:
+            cols = schema_map[tbl].get_all_columns()
+            lineage = trace_lineage(schema_map, tbl)
+            result_tables_lineage.append({
+                "table": tbl,
+                "columns": len(cols),
+                "lineage": lineage,
+            })
+
+        result = {
+            "procedure": proc_name,
+            "db_type": self.db_type,
+            "result_tables": result_tables_lineage,
+        }
+        return result, schema_map
+
+    def validate_lineage(self, schema_map: dict, result_tables: list[str], registry: set[str]) -> list[dict]:
+        """
+        验证血缘追溯结果中所有来源表是否在 registry 表清单中。
+        对链路中每一跳检查：只要某张表不是 tmp 前缀（即已穿透到源表）且不在 registry，
+        就说明该字段的临时表未被完全穿透，需要警告。
+        返回未通过的字段列表：
+          { result_table, result_column, root_table, root_column, chain, reason }
+        """
+        warnings = []
+        for tbl in result_tables:
+            if tbl.lower() not in schema_map:
+                continue
+            for col_name, col_source in schema_map[tbl.lower()].get_all_columns().items():
+                src_t = col_source.src_table or ""
+                src_c = col_source.src_column or ""
+                if not src_t:
+                    continue
+
+                # 获取完整链路
+                if re.match(r'^tmp', src_t):
+                    root_t, root_c, chain, _ = _trace_column(schema_map, src_t, src_c)
+                else:
+                    root_t, root_c = src_t, src_c
+                    chain = [src_t]
+
+                # 遍历链路每一跳：任何非 tmp 表不在 registry → 警告
+                for hop_tbl in chain:
+                    if not re.match(r'^tmp', hop_tbl) and hop_tbl.lower() not in registry:
+                        warnings.append({
+                            "result_table": tbl,
+                            "result_column": col_name,
+                            "root_table": root_t,
+                            "root_column": root_c,
+                            "chain": " → ".join(chain),
+                            "reason": f"链路中出现未注册的表 [{hop_tbl}]，说明临时表未被完全穿透",
+                        })
+                        break
+        return warnings
+
+# ---------------------------------------------------------------
+# 8. 跨过程血缘追溯
+# ---------------------------------------------------------------
+
+def _resolve_cross_procedure(
+    tmp_name: str,
+    current_proc: str,
+    conn,
+    visited: set,
+    dialect: str,
+    tmp_proc_map: dict,
+    cached_schemas: dict,
+) -> dict[str, TempTableSchema]:
+    """
+    解析创建 tmp_name 的存储过程，返回其完整 schema_map。
+    递归穿透子过程中的 tmp 表引用。
+    """
+    import re
+
+    if tmp_name not in tmp_proc_map:
+        return {}
+    creating_proc, _ = tmp_proc_map[tmp_name]
+    if creating_proc == current_proc:
+        return {}
+    if creating_proc in visited:
+        return {}
+    if creating_proc in cached_schemas:
+        return cached_schemas[creating_proc]
+
+    visited.add(creating_proc)
+
+    raw = conn.get_procedure_source(creating_proc, "public")
+    body = extract_body(raw)
+    stmts = split_statements(body)
+    sub_schema_map = build_schema_map(stmts, dialect)
+
+    # 递归穿透子过程中引用的所有 tmp 表（含子过程自己创建的）
+    for tbl in list(sub_schema_map.keys()):
+        if not re.match(r'^tmp', tbl):
+            continue
+        for src_tmp in sub_schema_map[tbl].source_table_names:
+            if re.match(r'^tmp', src_tmp):
+                # 即使 src_tmp 是 creating_proc 自己创建的，也要递归穿透
+                sub = _resolve_cross_procedure(
+                    src_tmp, creating_proc, conn, visited, dialect,
+                    tmp_proc_map, cached_schemas
+                )
+                if sub and src_tmp in sub:
+                    sub_schema_map[src_tmp] = sub[src_tmp]
+
+    # 对合并进来的子过程 schema，执行跨过程追溯（子过程中引用的 src 表）
+    _resolve_all_cross_procedures(
+        sub_schema_map, creating_proc,
+        conn, visited, dialect,
+        tmp_proc_map, cached_schemas
+    )
+    cached_schemas[creating_proc] = sub_schema_map
+    return sub_schema_map
+
+
+def _resolve_all_cross_procedures(
+    schema_map: dict[str, TempTableSchema],
+    current_proc: str,
+    conn,
+    visited: set,
+    dialect: str,
+    tmp_proc_map: dict,
+    cached_schemas: dict,
+):
+    """
+    扫描 schema_map 中所有 tmp 表的 source_table_names，
+    触发跨过程追溯并合并子过程的 schema。
+    """
+    import re
+
+    def _check_and_merge(src_tmp: str):
+        if src_tmp in schema_map:
+            return  # 已加载
+        if src_tmp not in tmp_proc_map:
+            return  # 未知来源
+        creating_proc, _ = tmp_proc_map[src_tmp]
+        if creating_proc == current_proc:
+            return  # 本地创建
+        sub_schema = _resolve_cross_procedure(
+            src_tmp, current_proc, conn, visited, dialect,
+            tmp_proc_map, cached_schemas
+        )
+        # 合入整个子过程 schema_map（包含所有嵌套 tmp 表）
+        if sub_schema:
+            for sub_tbl, sub_schema_obj in sub_schema.items():
+                if sub_tbl not in schema_map:
+                    schema_map[sub_tbl] = sub_schema_obj
+
+    # 持续迭代直到没有新的跨过程 tmp 表需要处理
+    # 用 seen 集合防止对未知 src_tmp 重复尝试（会一直返回空）
+    seen: set = set()
+    changed = True
+    while changed:
+        changed = False
+        for tbl in list(schema_map.keys()):
+            if not re.match(r'^tmp', tbl):
+                continue
+            for src_tmp in schema_map[tbl].source_table_names:
+                if re.match(r'^tmp', src_tmp) and src_tmp not in schema_map and src_tmp not in seen:
+                    seen.add(src_tmp)
+                    _check_and_merge(src_tmp)
+                    changed = True
+
+
+class ProcedureLineageParserV2:
+    """支持跨过程追溯的血缘解析器"""
+
+    def __init__(self, db_type: str = "postgresql", dialect: str = "postgres"):
+        self.db_type = db_type
+        self.dialect = dialect
+        self._tmp_proc_map: dict = {}
+        self._cached_schemas: dict = {}
+
+    def parse_full(self, proc_name: str, schema: str, conn) -> tuple[dict, dict]:
+        import re
+
+        # 构建 tmp → proc 映射（只做一次）
+        if not self._tmp_proc_map:
+            self._tmp_proc_map = conn.build_temp_table_procedure_map()
+
+        self._cached_schemas.clear()
+        visited: set = set()
+
+        # 解析当前过程
+        raw = conn.get_procedure_source(proc_name, schema)
+        body = extract_body(raw)
+        stmts = split_statements(body)
+        schema_map = build_schema_map(stmts, self.dialect)
+
+        # 跨过程追溯：加载所有引用的子过程 tmp 表
+        _resolve_all_cross_procedures(
+            schema_map, proc_name,
+            conn, visited, self.dialect,
+            self._tmp_proc_map, self._cached_schemas
+        )
+
+        # 识别结果表
+        result_tables = [t for t in schema_map if not re.match(r'^tmp', t)]
+
+        # 追溯血缘
+        result_tables_lineage = []
+        for tbl in result_tables:
+            cols = schema_map[tbl].get_all_columns()
+            lineage = trace_lineage(schema_map, tbl)
+            result_tables_lineage.append({
+                "table": tbl,
+                "columns": len(cols),
+                "lineage": lineage,
+            })
+
+        result = {
+            "procedure": proc_name,
+            "db_type": self.db_type,
+            "result_tables": result_tables_lineage,
+        }
+        return result, schema_map
+
+    def validate_lineage(self, schema_map: dict, result_tables: list[str], registry: set[str]) -> list[dict]:
+        return ProcedureLineageParser().validate_lineage(schema_map, result_tables, registry)
