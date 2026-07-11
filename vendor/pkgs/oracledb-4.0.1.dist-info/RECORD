@@ -1,9 +1,9 @@
 oracledb/__init__.py,sha256=WIdZmAJK3SPr69XaS7Pbl2_HGnaVZ0PJGK6dsdci2J8,39546
 oracledb/aq.py,sha256=HXlSLz1uDL6uYGFexHkObT-fXSwdIdo9uJeOyq9h9eI,24739
 oracledb/arrow_array.py,sha256=aReIFgQVcQs7TuqpDNL5YBESul8Jp3OA6JyNJV_JSDk,3407
-oracledb/arrow_impl.cpython-310-darwin.so,sha256=HDq0A9BYOq6cGkn8-sxspHJqdFoXvd5-wWaJFPC8sYo,509760
+oracledb/arrow_impl.cpython-310-x86_64-linux-gnu.so,sha256=9isW6-NxOKTbSNWE5gSHEws75RdFbi0-dlaHqUMDq6M,272424
 oracledb/base.py,sha256=CCPbBrJyI63yiz3K0r7VnaVmGE7wlwBVqW99N60qilg,2008
-oracledb/base_impl.cpython-310-darwin.so,sha256=mZ6gXaWzeVuFAVdeB6zSiZo-wE_u7oMa714z78tKhpw,4353792
+oracledb/base_impl.cpython-310-x86_64-linux-gnu.so,sha256=hRFoWBTF6iSloxRNAJlW5-syYRNGvV5vmrw6GQt3TVQ,2266648
 oracledb/builtin_hooks.py,sha256=fb5w5Lxp4WNIqfIOnx4H2e6x4xbJMN8p7jGlYF2JdEQ,3633
 oracledb/connect_params.py,sha256=Qdr6EuwELSeC9A2Dklv-SZfx73mkcbzgGuVMPGQnJD4,53182
 oracledb/connection.py,sha256=U4bOsqIXMLQ4uyD0NuvGMw4V5QSW8LPsyNZuRs8gotk,139988
@@ -30,8 +30,8 @@ oracledb/secret_values.py,sha256=0kdM2xhoW1iPFjsJdO09mOTR3fPIsHUIcLRzNJKHn2g,566
 oracledb/soda.py,sha256=VtFhWcJoNp7YaU1De6t7n5WIArMz_DlU0PvYgLDi2_c,30637
 oracledb/sparse_vector.py,sha256=aaUbSbP3Jf58ddsb6bAy83y8ptGuMb1ThJ8l_8YzUfg,4126
 oracledb/subscr.py,sha256=I4KNnE8gQzptQ6W06kyS6xF8q0Neg7ufErIfrQrTLf4,12616
-oracledb/thick_impl.cpython-310-darwin.so,sha256=403baW0ecmGkv22suuSWkcgD-17IPa2fH7vyOtoTksY,2564144
-oracledb/thin_impl.cpython-310-darwin.so,sha256=NVaKv8NdpeBIMbLXrPseSXNlPEdJkowIwjrno7MnAvQ,6142848
+oracledb/thick_impl.cpython-310-x86_64-linux-gnu.so,sha256=BgfCbigfScsFzocNzN0jkpIKUK7Ctg-HGvbRXFfA8Jo,1319376
+oracledb/thin_impl.cpython-310-x86_64-linux-gnu.so,sha256=kGrQtDqzOzfCN4gEh0hCKbibEKJmCfMAxAkT8PK_Tms,3226568
 oracledb/utils.py,sha256=3sv5-z_-6vqaXz4IsMR24Q2gtgZEu5W8O0AMMTdWHQg,19647
 oracledb/var.py,sha256=S0aMvacvBLJ6gFEI0X5LMLvzUXh65xzA3tH_Ga2tvqs,6931
 oracledb/version.py,sha256=WhM_HM1zNVYYMTwquoaDyIn22IwH9pCTJahNUu2c-yE,1538
@@ -40,10 +40,10 @@ oracledb/plugins/azure_tokens.py,sha256=FRSGlqsigF6IEUYbR73Faw4a_eJXLvcgZIgb8AU9
 oracledb/plugins/end_user_sec_provider.py,sha256=xlGbOW2atwroMZv0Rt0iBtBbYrChMbInKdOLLjr1p3o,4832
 oracledb/plugins/oci_config_provider.py,sha256=G8aUihhoTjqe6u9NksA55rzgw1GbfGGYaoCgDlMWv_U,8985
 oracledb/plugins/oci_tokens.py,sha256=1hakiNBdcwl_TFWKi_V1bwce-W_6szzbUo0y9SEyJZs,10489
+oracledb-4.0.1.dist-info/METADATA,sha256=_iQtTnhNKbjSIUQXK-OLHsqbkw9rNyYKUBEqdPjiyGw,7823
+oracledb-4.0.1.dist-info/WHEEL,sha256=_i500-b4YHWKqMCs_B36ATmns20cv69Dt9qQqPq0_y4,190
+oracledb-4.0.1.dist-info/top_level.txt,sha256=DGlJh0bBtAUvhjHF-pPnrVCzNhW87yzaKB_1_FP28uU,9
+oracledb-4.0.1.dist-info/RECORD,,
 oracledb-4.0.1.dist-info/licenses/LICENSE.txt,sha256=KrL2EAZ6IAarB1SPKnKWC-V0tZM2nJNANtbYwDREBco,12570
 oracledb-4.0.1.dist-info/licenses/NOTICE.txt,sha256=phn87I1ycbdHGq5SkA7abFgp0QSXe5LCGN_jVs4Oajg,56
 oracledb-4.0.1.dist-info/licenses/THIRD_PARTY_LICENSES.txt,sha256=4HEKfr0_uq9-7ogpsW4rvhT84jX1BJYnmMrn62GfS8g,90513
-oracledb-4.0.1.dist-info/METADATA,sha256=_iQtTnhNKbjSIUQXK-OLHsqbkw9rNyYKUBEqdPjiyGw,7823
-oracledb-4.0.1.dist-info/WHEEL,sha256=hTFKNGFhAKZvaj1emh-VShZjG6rlN1V71o2ZP2vIZQc,114
-oracledb-4.0.1.dist-info/top_level.txt,sha256=DGlJh0bBtAUvhjHF-pPnrVCzNhW87yzaKB_1_FP28uU,9
-oracledb-4.0.1.dist-info/RECORD,,
