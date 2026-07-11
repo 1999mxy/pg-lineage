@@ -173,3 +173,75 @@ pg-lineage/
       formatter.py      - 输出格式化（summary/json/csv/sql）
       mapping_fmt.py    - 字段血缘 mapping 文档
   tests/
+
+十、完整执行示例（tristan 数据库）
+------------------------------------
+
+### 1. 数据库现状
+
+| 类型 | 表名 |
+|------|------|
+| 源表（血缘终点） | src_customer, src_customer_address, src_orders, src_orders_detail, src_product, src_product_inventory |
+| 注册表 | lineage_source_table_registry（字段：table_name, table_desc, created_at） |
+| 存储过程 | p_gen_sale_report, p_sale_analysis, p_inventory_analysis, p_cross_proc_demo |
+
+### 2. 执行命令
+
+```bash
+cd ~/codex-skills/pg-lineage
+
+# 示例 A：基础血缘分析（summary 格式）
+python3 run.py \
+    -H localhost -P 5432 -d tristan -u tristan \
+    --proc p_gen_sale_report --schema public --format summary
+
+# 示例 B：启用注册表校验（防止临时表未穿透）
+python3 run.py \
+    -H localhost -P 5432 -d tristan -u tristan \
+    --proc p_gen_sale_report --schema public --format summary \
+    --validate-registry
+
+# 示例 C：自定义注册表名（tristan 库使用默认名即可）
+python3 run.py \
+    -H localhost -P 5432 -d tristan -u tristan \
+    --proc p_sale_analysis --schema public --format summary \
+    --validate-registry \
+    --registry-table lineage_source_table_registry
+
+# 示例 D：输出 mapping 文档（结构化血缘明细）
+python3 run.py \
+    -H localhost -P 5432 -d tristan -u tristan \
+    --proc p_sale_analysis --schema public --format mapping
+
+# 示例 E：跨过程追溯（存储过程引用了其他过程的临时表）
+python3 run.py \
+    -H localhost -P 5432 -d tristan -u tristan \
+    --proc p_cross_proc_demo --schema public --format summary \
+    --cross-proc --validate-registry
+
+# 示例 F：输出 JSON（程序化消费）
+python3 run.py \
+    -H localhost -P 5432 -d tristan -u tristan \
+    --proc p_gen_sale_report --schema public --format json > lineage.json
+
+# 示例 G：输出 CSV（导入 Excel 分析）
+python3 run.py \
+    -H localhost -P 5432 -d tristan -u tristan \
+    --proc p_gen_sale_report --schema public --format csv > lineage.csv
+
+# 示例 H：生成写入 lineage_column 表的 INSERT 语句
+python3 run.py \
+    -H localhost -P 5432 -d tristan -u tristan \
+    --proc p_gen_sale_report --schema public --format sql > insert_lineage.sql
+
+# 示例 I：切换 SQL 方言（解析 Oracle / TDSQL 存储过程）
+python3 run.py \
+    -H localhost -P 1521 -d XE -u scott -p tiger \
+    --proc MY_PROC --schema SCOTT --dialect oracle --format summary
+
+# 示例 J：表不存在时静默跳过（不阻断分析流程）
+python3 run.py \
+    -H localhost -P 5432 -d tristan -u tristan \
+    --proc p_gen_sale_report --schema public --format summary \
+    --validate-registry --registry-table my_registry
+```
