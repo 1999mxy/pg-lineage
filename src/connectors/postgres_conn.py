@@ -73,18 +73,29 @@ class PostgresConnector:
     def __exit__(self, *args):
         self.close()
 
-    def get_source_table_registry(self) -> set[str]:
+    def get_source_table_registry(self, table_name: str = "lineage_source_table_registry") -> tuple[set[str], bool]:
         """
-        从 lineage_source_table_registry 表读取所有已注册的来源表名。
-        表不存在时返回空集，不抛异常。
+        从注册表读取所有已注册的来源表名。
+        返回 (set, exists)。exists=False 表示表不存在，不抛异常。
         """
         if self._conn is None:
             self.connect()
         cur = self._conn.cursor()
+        # 先检查表是否存在
         cur.execute("""
-            SELECT table_name FROM lineage_source_table_registry
-            WHERE table_name IS NOT NULL
-        """)
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = %s
+            )
+        """, (table_name,))
+        exists = cur.fetchone()[0]
+        if not exists:
+            cur.close()
+            return set(), False
+        cur.execute(f'SELECT table_name FROM "{table_name}" WHERE table_name IS NOT NULL')
+        rows = cur.fetchall()
+        cur.close()
+        return {r[0].lower() for r in rows}, True
         rows = cur.fetchall()
         cur.close()
         return {r[0].lower() for r in rows}

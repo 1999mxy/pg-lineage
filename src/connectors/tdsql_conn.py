@@ -61,18 +61,23 @@ class TDSqlConnector:
     def __exit__(self, *args):
         self.close()
 
-    def get_source_table_registry(self) -> set[str]:
-        """从 lineage_source_table_registry 表读取所有已注册的来源表名"""
+    def get_source_table_registry(self, table_name: str = "lineage_source_table_registry") -> tuple[set[str], bool]:
+        """从注册表读取所有已注册的来源表名。返回 (set, exists)。"""
         if self._conn is None:
             self.connect()
         cur = self._conn.cursor()
         cur.execute("""
-            SELECT table_name FROM lineage_source_table_registry
-            WHERE table_name IS NOT NULL
-        """)
+            SELECT COUNT(*) FROM information_schema.tables
+            WHERE table_schema = %s AND table_name = %s
+        """, (self.db, table_name))
+        exists = cur.fetchone()[0] > 0
+        if not exists:
+            cur.close()
+            return set(), False
+        cur.execute(f'SELECT table_name FROM `{table_name}` WHERE table_name IS NOT NULL')
         rows = cur.fetchall()
         cur.close()
-        return {r[0].lower() for r in rows}
+        return {r[0].lower() for r in rows}, True
 
     def get_table_columns(self, table_name: str, schema: str = None) -> list[str]:
         """从 information_schema.columns 读取表的所有列名"""

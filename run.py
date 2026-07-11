@@ -53,7 +53,9 @@ def parse_args():
     parser.add_argument("--cross-proc", action="store_true",
                         help="跨过程追溯：穿透子过程临时表至最上层源表")
     parser.add_argument("--validate-registry", action="store_true",
-                        help="根据 lineage_source_table_registry 校验来源表是否已注册")
+                        help="启用来源表注册校验")
+    parser.add_argument("--registry-table", default="lineage_source_table_registry",
+                        help="来源表注册表表名，默认 lineage_source_table_registry")
     return parser.parse_args()
 
 
@@ -95,10 +97,20 @@ def main():
 
         # 校验
         validation_warnings = []
+        tbl_exists = False
         if args.validate_registry:
-            registry = conn.get_source_table_registry()
+            registry, tbl_exists = conn.get_source_table_registry(args.registry_table)
             result_tables = [rt["table"] for rt in result.get("result_tables", [])]
-            validation_warnings = parser.validate_lineage(schema_map, result_tables, registry)
+            if not tbl_exists:
+                msg = (
+                    "[pg-lineage] 注册表 [" + args.registry_table + "] 不存在，跳过校验。\n"
+                    "[pg-lineage] 如需启用校验，请先创建注册表：\n"
+                    "  CREATE TABLE " + args.registry_table + " (table_name VARCHAR(100) PRIMARY KEY);\n"
+                    "  INSERT INTO " + args.registry_table + " VALUES ('your_source_table');\n"
+                )
+                err_file.write(msg)
+            else:
+                validation_warnings = parser.validate_lineage(schema_map, result_tables, registry)
 
         # 输出
         if args.format == "json":
@@ -128,7 +140,7 @@ def main():
             err_file.write("-" * 120 + "\n")
             err_file.write("共 {} 条警告\n".format(len(validation_warnings)))
             err_file.write(sep + "\n")
-        elif args.validate_registry:
+        elif args.validate_registry and tbl_exists:
             err_file.write("[pg-lineage] All source tables are registered. Validation passed.\n")
 
         err_file.close()
