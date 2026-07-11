@@ -25,6 +25,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import argparse
 
 from src.connectors.postgres_conn import PostgresConnector
+from src.connectors.oracle_conn   import OracleConnector
+from src.connectors.tdsql_conn    import TDSqlConnector
 from src.parser import ProcedureLineageParser, ProcedureLineageParserV2
 from src.output.formatter import to_json, to_csv, summary, to_sql_insert, to_mapping
 
@@ -71,7 +73,14 @@ def main():
     info("连接 {}，解析存储过程 {}.{} ...".format(conn_desc, args.schema, args.proc))
 
     try:
-        conn = PostgresConnector(
+        dialect_map = {
+            "postgres": PostgresConnector,
+            "oracle":   OracleConnector,
+            "mysql":    TDSqlConnector,
+            "tsql":     TDSqlConnector,
+        }
+        ConnClass = dialect_map.get(args.dialect, PostgresConnector)
+        conn = ConnClass(
             host=args.host,
             port=args.port,
             db=args.db,

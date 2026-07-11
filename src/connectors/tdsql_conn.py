@@ -1,4 +1,5 @@
 """TD SQL 数据库连接器（MySQL 兼容）"""
+import re
 from typing import Optional
 
 
@@ -59,3 +60,59 @@ class TDSqlConnector:
 
     def __exit__(self, *args):
         self.close()
+
+    def get_source_table_registry(self) -> set[str]:
+        """从 lineage_source_table_registry 表读取所有已注册的来源表名"""
+        if self._conn is None:
+            self.connect()
+        cur = self._conn.cursor()
+        cur.execute("""
+            SELECT table_name FROM lineage_source_table_registry
+            WHERE table_name IS NOT NULL
+        """)
+        rows = cur.fetchall()
+        cur.close()
+        return {r[0].lower() for r in rows}
+
+    def get_table_columns(self, table_name: str, schema: str = None) -> list[str]:
+        """从 information_schema.columns 读取表的所有列名"""
+        if self._conn is None:
+            self.connect()
+        schema = schema or self.db
+        cur = self._conn.cursor()
+        cur.execute("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s
+            ORDER BY ordinal_position
+        """, (schema, table_name))
+        rows = cur.fetchall()
+        cur.close()
+        return [r[0].lower() for r in rows]
+
+    def build_temp_table_procedure_map(self) -> dict[str, tuple[str, str]]:
+        """扫描全库所有存储过程源码，构建 {temp_table_name: (proc_name, source)}"""
+        if self._conn is None:
+            self.connect()
+        cur = self._conn.cursor()
+        cur.execute("""
+            SELECT ROUTINE_NAME, ROUTINE_DEFINITION
+            FROM information_schema.ROUTINES
+            WHERE ROUTINE_SCHEMA = %s
+              AND ROUTINE_TYPE IN ('PROCEDURE', 'FUNCTION')
+        """, (self.db,))
+        rows = cur.fetchall()
+        cur.close()
+
+        result: dict[str, tuple[str, str]] = {}
+        create_pattern = re.compile(
+            r'(?i)CREATE\s+(?:TEMPORARY\s+)?TABLE\s+(\w+)',
+        )
+        for proc_name, proc_src in rows:
+            if not proc_src:
+                continue
+            for m in create_pattern.finditer(proc_src):
+                tmp_name = m.group(1).lower()
+                if tmp_name not in result:
+                    result[tmp_name] = (proc_name, proc_src)
+        return result
