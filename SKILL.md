@@ -12,7 +12,8 @@
 ## 约束
 
 - 临时表命名必须以 `tmp` 开头（如 `tmp1_cust_addr`、`tmp_combined_orders`）
-- 源表命名以 `src_` 开头，结果表命名不含 `tmp`/`src_` 前缀
+- 源表命名建议以 `src_` 开头，结果表命名不含 `tmp`/`src_` 前缀。
+   所有可作为血缘终点的来源表须预先写入 lineage_source_table_registry 表。
 - 存储过程内不写 `SELECT *`
 - 结果表命名不含 `tmp` 前缀
 

@@ -11,7 +11,8 @@ pg-lineage 是一个 Codex skill，用于对 PostgreSQL 存储过程进行字段
 二、核心功能
 -----------
 1. 字段级血缘追溯
-   对结果表的每个字段，追溯到 src_ 开头的最上层来源表及字段。
+   对结果表的每个字段，追溯到最上层来源表及字段。
+   最上层表的判定规则：不在 lineage_source_table_registry 表中的表继续穿透，直至命中注册表中的表。
 
 2. 变换类型识别
    自动区分以下变换类型：
@@ -25,7 +26,7 @@ pg-lineage 是一个 Codex skill，用于对 PostgreSQL 存储过程进行字段
    - 类型转换：CAST / ::
 
 3. expression 透传
-   跨多层临时表回溯完整表达式，自动替换 tmp.col 为真实的 src_table.col。
+   跨多层临时表回溯完整表达式，自动替换 tmp.col 为真实的来源表.列名。
 
 4. 跨存储过程追溯
    当存储过程 A 引用了存储过程 B 创建的临时表时，
@@ -107,7 +108,8 @@ Codex 会自动读取此 skill 并调用 run.py 执行。
 六、约束
 -------
 - 临时表命名必须以 tmp 开头，如 tmp1_cust_addr、tmp_combined_orders
-- 源表命名以 src_ 开头，结果表命名不含 tmp / src_ 前缀
+- 源表命名建议以 src_ 开头，结果表命名不含 tmp / src_ 前缀
+- 所有可作为血缘终点的来源表须预先写入 lineage_source_table_registry 表。
 - 存储过程内不写 SELECT * INTO 变量（into 变量不做血缘分析）
 - 动态 SQL 中，变量拼接的表名无法静态还原，字段级血缘降级为近似值
 
